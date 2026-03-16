@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from abc import ABC
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import AsyncIterable, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Generic
 
 from pydantic_ai import _instructions
 from pydantic_ai.builtin_tools import AbstractBuiltinTool
-from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
+from pydantic_ai.messages import AgentStreamEvent, ModelMessage, ModelResponse, ToolCallPart
 from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import AgentDepsT, BuiltinToolFunc, RunContext
@@ -85,6 +85,17 @@ class AbstractCapability(ABC, Generic[AgentDepsT]):
     ) -> AgentRunResult[Any]:
         """Wraps the entire agent run. handler() executes the run."""
         return await handler()
+
+    # --- Event stream hook ---
+
+    async def wrap_run_event_stream(
+        self,
+        ctx: RunContext[AgentDepsT],
+        *,
+        stream: AsyncIterable[AgentStreamEvent],
+    ) -> AsyncIterable[AgentStreamEvent]:
+        """Wraps the event stream for a streamed node. Can observe or transform events."""
+        return stream
 
     # --- Model request lifecycle hooks ---
 

@@ -44,6 +44,8 @@ from .tools import (
 )
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from .models.instrumented import InstrumentationSettings
 
 __all__ = (
@@ -427,6 +429,36 @@ async def _prepare_request_parameters(
 
 
 @dataclasses.dataclass
+class _SkipStreamedResponse(models.StreamedResponse):
+    """Minimal StreamedResponse for SkipModelRequest — yields no events."""
+
+    _response: _messages.ModelResponse = field(repr=False)
+
+    @property
+    def model_name(self) -> str:
+        return self._response.model_name or ''
+
+    @property
+    def provider_name(self) -> str | None:
+        return None
+
+    @property
+    def provider_url(self) -> str | None:
+        return None
+
+    @property
+    def timestamp(self) -> datetime:
+        return self._response.timestamp
+
+    async def _get_event_iterator(self) -> AsyncIterator[_messages.ModelResponseStreamEvent]:
+        return
+        yield  # pragma: no cover
+
+    def get(self) -> _messages.ModelResponse:
+        return self._response
+
+
+@dataclasses.dataclass
 class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
     """The node that makes a request to the model using the last message in state.message_history."""
 
@@ -456,40 +488,131 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
     ) -> AsyncIterator[result.AgentStream[DepsT, T]]:
         assert not self._did_stream, 'stream() should only be called once per node'
 
-        model_settings, model_request_parameters, message_history, run_context = await self._prepare_request(ctx)
+        try:
+            model_settings, model_request_parameters, message_history, run_context = await self._prepare_request(ctx)
+        except exceptions.SkipModelRequest as e:
+            # SkipModelRequest in stream path: yield an empty stream and finish handling
+            self._did_stream = True
+            ctx.state.usage.requests += 1
+            skip_mrp = await _prepare_request_parameters(ctx)
+            skip_sr = _SkipStreamedResponse(model_request_parameters=skip_mrp, _response=e.response)
+            agent_stream = result.AgentStream[DepsT, T](
+                _raw_stream_response=skip_sr,
+                _output_schema=ctx.deps.output_schema,
+                _model_request_parameters=skip_mrp,
+                _output_validators=ctx.deps.output_validators,
+                _run_ctx=build_run_context(ctx),
+                _usage_limits=ctx.deps.usage_limits,
+                _tool_manager=ctx.deps.tool_manager,
+                _metadata_getter=lambda: ctx.state.metadata,
+            )
+            yield agent_stream
+            await self._finish_handling(ctx, e.response)
+            assert self._result is not None
+            return
 
-        with set_current_run_context(run_context):
-            async with ctx.deps.model.request_stream(
-                message_history, model_settings, model_request_parameters, run_context
-            ) as streamed_response:
-                self._did_stream = True
-                ctx.state.usage.requests += 1
-                agent_stream = result.AgentStream[DepsT, T](
-                    _raw_stream_response=streamed_response,
-                    _output_schema=ctx.deps.output_schema,
-                    _model_request_parameters=model_request_parameters,
-                    _output_validators=ctx.deps.output_validators,
-                    _run_ctx=build_run_context(ctx),
-                    _usage_limits=ctx.deps.usage_limits,
-                    _tool_manager=ctx.deps.tool_manager,
-                    _metadata_getter=lambda: ctx.state.metadata,
-                )
-                yield agent_stream
-                # In case the user didn't manually consume the full stream, ensure it is fully consumed here,
-                # otherwise usage won't be properly counted:
-                async for _ in agent_stream:
-                    pass
+        effective_ms = model_settings or ModelSettings()
 
-        model_response = streamed_response.get()
+        # Task-based wrap_model_request for streaming
+        stream_ready = asyncio.Event()
+        stream_done = asyncio.Event()
+        agent_stream_holder: list[result.AgentStream[DepsT, T]] = []
 
-        await self._finish_handling(
-            ctx,
-            model_response,
-            messages=message_history,
-            model_settings=model_settings or ModelSettings(),
-            model_request_parameters=model_request_parameters,
+        async def _streaming_handler(
+            msgs: list[_messages.ModelMessage],
+            ms: ModelSettings,
+            mrp: models.ModelRequestParameters,
+        ) -> _messages.ModelResponse:
+            with set_current_run_context(run_context):
+                async with ctx.deps.model.request_stream(msgs, ms, mrp, run_context) as sr:
+                    self._did_stream = True
+                    ctx.state.usage.requests += 1
+                    agent_stream = result.AgentStream[DepsT, T](
+                        _raw_stream_response=sr,
+                        _output_schema=ctx.deps.output_schema,
+                        _model_request_parameters=mrp,
+                        _output_validators=ctx.deps.output_validators,
+                        _run_ctx=build_run_context(ctx),
+                        _usage_limits=ctx.deps.usage_limits,
+                        _tool_manager=ctx.deps.tool_manager,
+                        _metadata_getter=lambda: ctx.state.metadata,
+                    )
+                    agent_stream_holder.append(agent_stream)
+                    stream_ready.set()
+                    await stream_done.wait()
+            return sr.get()
+
+        wrap_task = asyncio.create_task(
+            ctx.deps.root_capability.wrap_model_request(
+                run_context,
+                messages=message_history,
+                model_settings=effective_ms,
+                model_request_parameters=model_request_parameters,
+                handler=_streaming_handler,
+            )
         )
-        assert self._result is not None  # this should be set by the previous line
+
+        # Wait for handler to start or wrap to complete (short-circuit)
+        ready_waiter = asyncio.create_task(stream_ready.wait())
+        await asyncio.wait({ready_waiter, wrap_task}, return_when=asyncio.FIRST_COMPLETED)
+        ready_waiter.cancel()
+
+        if wrap_task.done() and not stream_ready.is_set():
+            # wrap_model_request short-circuited (didn't call handler)
+            model_response = wrap_task.result()
+            self._did_stream = True
+            ctx.state.usage.requests += 1
+            skip_sr = _SkipStreamedResponse(model_request_parameters=model_request_parameters, _response=model_response)
+            agent_stream = result.AgentStream[DepsT, T](
+                _raw_stream_response=skip_sr,
+                _output_schema=ctx.deps.output_schema,
+                _model_request_parameters=model_request_parameters,
+                _output_validators=ctx.deps.output_validators,
+                _run_ctx=build_run_context(ctx),
+                _usage_limits=ctx.deps.usage_limits,
+                _tool_manager=ctx.deps.tool_manager,
+                _metadata_getter=lambda: ctx.state.metadata,
+            )
+            yield agent_stream
+            await self._finish_handling(
+                ctx,
+                model_response,
+                messages=message_history,
+                model_settings=effective_ms,
+                model_request_parameters=model_request_parameters,
+            )
+            assert self._result is not None
+            return
+
+        # Normal path: handler was called, stream is ready
+        stream_error: BaseException | None = None
+        try:
+            yield agent_stream_holder[0]
+            # Ensure stream is fully consumed for proper usage counting
+            async for _ in agent_stream_holder[0]:
+                pass
+        except BaseException as exc:
+            stream_error = exc
+            raise
+        finally:
+            stream_done.set()
+
+            if stream_error is not None:
+                wrap_task.cancel()
+                try:
+                    await wrap_task
+                except (asyncio.CancelledError, BaseException):
+                    pass
+            else:
+                model_response = await wrap_task
+                await self._finish_handling(
+                    ctx,
+                    model_response,
+                    messages=message_history,
+                    model_settings=effective_ms,
+                    model_request_parameters=model_request_parameters,
+                )
+                assert self._result is not None
 
     async def _make_request(
         self, ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, NodeRunEndT]]

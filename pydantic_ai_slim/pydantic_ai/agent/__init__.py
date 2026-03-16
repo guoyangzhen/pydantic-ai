@@ -1,5 +1,6 @@
 from __future__ import annotations as _annotations
 
+import asyncio
 import dataclasses
 import inspect
 import json
@@ -539,67 +540,6 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
     def __repr__(self) -> str:
         return f'{type(self).__name__}(model={self.model!r}, name={self.name!r}, end_strategy={self.end_strategy!r}, model_settings={self.model_settings!r}, output_type={self.output_type!r}, instrument={self.instrument!r})'
 
-    async def run(
-        self,
-        user_prompt: str | Sequence[_messages.UserContent] | None = None,
-        *,
-        output_type: Any | None = None,
-        message_history: Sequence[_messages.ModelMessage] | None = None,
-        deferred_tool_results: DeferredToolResults | None = None,
-        model: models.Model | models.KnownModelName | str | None = None,
-        instructions: _instructions.Instructions[AgentDepsT] = None,
-        deps: AgentDepsT = None,
-        model_settings: ModelSettings | None = None,
-        usage_limits: _usage.UsageLimits | None = None,
-        usage: _usage.RunUsage | None = None,
-        metadata: Any | None = None,
-        infer_name: bool = True,
-        toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None,
-        builtin_tools: Sequence[AbstractBuiltinTool | BuiltinToolFunc[AgentDepsT]] | None = None,
-        event_stream_handler: Any | None = None,
-    ) -> AgentRunResult[Any]:
-        if infer_name and self.name is None:
-            self._infer_name(inspect.currentframe())
-
-        root_cap = self.root_capability
-
-        async def do_run() -> AgentRunResult[Any]:
-            result = await super(Agent, self).run(
-                user_prompt,
-                output_type=output_type,
-                message_history=message_history,
-                deferred_tool_results=deferred_tool_results,
-                model=model,
-                instructions=instructions,
-                deps=deps,
-                model_settings=model_settings,
-                usage_limits=usage_limits,
-                usage=usage,
-                metadata=metadata,
-                infer_name=False,
-                toolsets=toolsets,
-                builtin_tools=builtin_tools,
-                event_stream_handler=event_stream_handler,
-            )
-            return result
-
-        # Build a minimal RunContext for run-level hooks
-        model_used = self._get_model(model)
-        run_ctx = RunContext[AgentDepsT](
-            deps=self._get_deps(deps),
-            model=model_used,
-            usage=usage or _usage.RunUsage(),
-            prompt=user_prompt,
-        )
-
-        # Apply wrap_run
-        agent_result = await root_cap.wrap_run(run_ctx, handler=do_run)
-
-        # Apply after_run
-        agent_result = await root_cap.after_run(run_ctx, result=agent_result)
-
-        return agent_result
-
     @overload
     def iter(
         self,
@@ -641,7 +581,7 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
     ) -> AbstractAsyncContextManager[AgentRun[AgentDepsT, RunOutputDataT]]: ...
 
     @asynccontextmanager
-    async def iter(
+    async def iter(  # noqa: C901
         self,
         user_prompt: str | Sequence[_messages.UserContent] | None = None,
         *,
@@ -870,16 +810,58 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
                     # Build RunContext for run lifecycle hooks
                     run_ctx = _agent_graph.build_run_context(agent_run.ctx)
 
-                    # Call before_run hook
-                    await self.root_capability.before_run(run_ctx)
+                    # Task-based wrap_run: handler calls before_run, signals readiness,
+                    # then waits for caller to finish
+                    _run_ready = asyncio.Event()
+                    _run_done = asyncio.Event()
+                    _run_error: BaseException | None = None
+
+                    async def _do_run() -> AgentRunResult[Any]:
+                        await self.root_capability.before_run(run_ctx)
+                        _run_ready.set()
+                        await _run_done.wait()
+                        if _run_error is not None:
+                            raise _run_error
+                        r = agent_run.result
+                        assert r is not None
+                        return r
+
+                    _wrap_task = asyncio.create_task(self.root_capability.wrap_run(run_ctx, handler=_do_run))
+
+                    # Wait for handler to start or wrap_run to complete (short-circuit)
+                    _ready_waiter = asyncio.create_task(_run_ready.wait())
+                    await asyncio.wait({_ready_waiter, _wrap_task}, return_when=asyncio.FIRST_COMPLETED)
+                    _ready_waiter.cancel()
+
+                    _short_circuited = _wrap_task.done() and not _run_ready.is_set()
+                    if _short_circuited:
+                        _result = _wrap_task.result()
+                        _result = await self.root_capability.after_run(run_ctx, result=_result)
+                        agent_run._result_override = _result  # pyright: ignore[reportPrivateUsage]
 
                     try:
                         yield agent_run
+                    except BaseException as _exc:
+                        _run_error = _exc
+                        raise
                     finally:
                         if agent_run.result is not None:
                             run_metadata = self._resolve_and_store_metadata(agent_run.ctx, metadata)
                         else:
                             run_metadata = graph_run.state.metadata
+
+                        if not _short_circuited:
+                            _run_done.set()
+                            if _run_error is None and agent_run.result is not None:
+                                _result = await _wrap_task
+                                _result = await self.root_capability.after_run(run_ctx, result=_result)
+                                agent_run._result_override = _result  # pyright: ignore[reportPrivateUsage]
+                            elif not _wrap_task.done():
+                                _wrap_task.cancel()
+                                try:
+                                    await _wrap_task
+                                except (asyncio.CancelledError, BaseException):
+                                    pass
 
                     final_result = agent_run.result
                     if (

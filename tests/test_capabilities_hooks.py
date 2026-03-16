@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterable, AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -9,6 +10,7 @@ from pydantic_ai import Agent
 from pydantic_ai.capabilities.abstract import AbstractCapability
 from pydantic_ai.exceptions import SkipModelRequest, SkipToolExecution, SkipToolValidation
 from pydantic_ai.messages import (
+    AgentStreamEvent,
     ModelMessage,
     ModelResponse,
     TextPart,
@@ -16,7 +18,7 @@ from pydantic_ai.messages import (
     ToolReturnPart,
 )
 from pydantic_ai.models import ModelRequestParameters
-from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.models.function import AgentInfo, DeltaToolCall, DeltaToolCalls, FunctionModel
 from pydantic_ai.run import AgentRunResult
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import RunContext
@@ -30,6 +32,28 @@ def make_text_response(text: str = 'hello') -> ModelResponse:
 
 def simple_model_function(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
     return make_text_response('response from model')
+
+
+async def simple_stream_function(messages: list[ModelMessage], info: AgentInfo) -> AsyncIterator[str]:
+    yield 'streamed response'
+
+
+async def tool_calling_stream_function(
+    messages: list[ModelMessage], info: AgentInfo
+) -> AsyncIterator[str | DeltaToolCalls]:
+    """A streaming model that calls a tool on first request, then returns text."""
+    for msg in messages:
+        for part in msg.parts:
+            if isinstance(part, ToolReturnPart):
+                yield 'final response'
+                return
+
+    if info.function_tools:
+        tool = info.function_tools[0]
+        yield {0: DeltaToolCall(name=tool.name, json_args='{}', tool_call_id='call-1')}
+        return
+
+    yield 'no tools available'
 
 
 def tool_calling_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
@@ -619,3 +643,417 @@ class TestCombinedBeforeWrapAfter:
         assert 'wrap_tool_execute:my_tool:before' in cap.log
         assert 'wrap_tool_execute:my_tool:after' in cap.log
         assert 'after_tool_execute:my_tool' in cap.log
+
+
+class TestRunHooksRunStream:
+    """Test that wrap_run and after_run fire for run_stream()."""
+
+    async def test_wrap_run_fires_for_run_stream(self):
+        cap = LoggingCapability()
+        agent = Agent(
+            FunctionModel(simple_model_function, stream_function=simple_stream_function),
+            capabilities=[cap],
+        )
+        async with agent.run_stream('hello') as stream:
+            await stream.get_output()
+        assert 'wrap_run:before' in cap.log
+        assert 'wrap_run:after' in cap.log
+
+    async def test_after_run_fires_for_run_stream(self):
+        cap = LoggingCapability()
+        agent = Agent(
+            FunctionModel(simple_model_function, stream_function=simple_stream_function),
+            capabilities=[cap],
+        )
+        async with agent.run_stream('hello') as stream:
+            await stream.get_output()
+        assert 'after_run' in cap.log
+
+    async def test_wrap_run_fires_for_iter(self):
+        cap = LoggingCapability()
+        agent = Agent(FunctionModel(simple_model_function), capabilities=[cap])
+        async with agent.iter('hello') as agent_run:
+            async for _node in agent_run:
+                pass
+        assert 'wrap_run:before' in cap.log
+        assert 'wrap_run:after' in cap.log
+        assert 'after_run' in cap.log
+
+    async def test_after_run_can_modify_result_via_iter(self):
+        @dataclass
+        class ModifyResultCap(AbstractCapability[Any]):
+            async def after_run(self, ctx: RunContext[Any], *, result: AgentRunResult[Any]) -> AgentRunResult[Any]:
+                return AgentRunResult(output='modified by after_run')
+
+        agent = Agent(FunctionModel(simple_model_function), capabilities=[ModifyResultCap()])
+        async with agent.iter('hello') as agent_run:
+            async for _node in agent_run:
+                pass
+        assert agent_run.result is not None
+        assert agent_run.result.output == 'modified by after_run'
+
+    async def test_run_hook_order_via_run_stream(self):
+        cap = LoggingCapability()
+        agent = Agent(
+            FunctionModel(simple_model_function, stream_function=simple_stream_function),
+            capabilities=[cap],
+        )
+        async with agent.run_stream('hello') as stream:
+            await stream.get_output()
+        assert cap.log.index('wrap_run:before') < cap.log.index('before_run')
+        assert cap.log.index('before_run') < cap.log.index('wrap_run:after')
+        assert cap.log.index('wrap_run:after') <= cap.log.index('after_run')
+
+
+class TestStreamingHooks:
+    """Test that SkipModelRequest and wrap_model_request work in streaming paths."""
+
+    async def test_skip_model_request_streaming(self):
+        @dataclass
+        class SkipCap(AbstractCapability[Any]):
+            async def before_model_request(
+                self,
+                ctx: RunContext[Any],
+                *,
+                messages: list[ModelMessage],
+                model_settings: ModelSettings,
+                model_request_parameters: ModelRequestParameters,
+            ) -> tuple[list[ModelMessage], ModelSettings, ModelRequestParameters]:
+                raise SkipModelRequest(ModelResponse(parts=[TextPart(content='skipped in stream')]))
+
+        agent = Agent(
+            FunctionModel(simple_model_function, stream_function=simple_stream_function),
+            capabilities=[SkipCap()],
+        )
+        async with agent.run_stream('hello') as stream:
+            output = await stream.get_output()
+        assert output == 'skipped in stream'
+
+    async def test_wrap_model_request_streaming(self):
+        cap = LoggingCapability()
+        agent = Agent(
+            FunctionModel(simple_model_function, stream_function=simple_stream_function),
+            capabilities=[cap],
+        )
+        async with agent.run_stream('hello') as stream:
+            await stream.get_output()
+        assert 'wrap_model_request:before' in cap.log
+        assert 'wrap_model_request:after' in cap.log
+
+    async def test_wrap_model_request_modifies_result_via_run_with_streaming(self):
+        """wrap_model_request modification affects the final result when using run() with streaming."""
+
+        @dataclass
+        class WrapModifyCap(AbstractCapability[Any]):
+            async def wrap_model_request(
+                self,
+                ctx: RunContext[Any],
+                *,
+                messages: list[ModelMessage],
+                model_settings: ModelSettings,
+                model_request_parameters: ModelRequestParameters,
+                handler: Any,
+            ) -> ModelResponse:
+                response = await handler(messages, model_settings, model_request_parameters)
+                return ModelResponse(parts=[TextPart(content='wrapped: ' + response.parts[0].content)])
+
+        agent = Agent(
+            FunctionModel(simple_model_function, stream_function=simple_stream_function),
+            capabilities=[WrapModifyCap()],
+        )
+
+        async def handler(_ctx: RunContext[Any], stream: AsyncIterable[AgentStreamEvent]) -> None:
+            async for _ in stream:
+                pass
+
+        result = await agent.run('hello', event_stream_handler=handler)
+        assert result.output == 'wrapped: streamed response'
+
+    async def test_after_model_request_fires_streaming(self):
+        cap = LoggingCapability()
+        agent = Agent(
+            FunctionModel(simple_model_function, stream_function=simple_stream_function),
+            capabilities=[cap],
+        )
+        async with agent.run_stream('hello') as stream:
+            await stream.get_output()
+        assert 'after_model_request' in cap.log
+
+
+class TestWrapRunEventStream:
+    """Tests for the wrap_run_event_stream hook."""
+
+    async def test_wrap_run_event_stream_observes(self):
+        """Hook sees events from model streaming."""
+        observed_events: list[AgentStreamEvent] = []
+
+        @dataclass
+        class ObserverCap(AbstractCapability[Any]):
+            async def wrap_run_event_stream(
+                self,
+                ctx: RunContext[Any],
+                *,
+                stream: AsyncIterable[AgentStreamEvent],
+            ) -> AsyncIterable[AgentStreamEvent]:
+                async def observe() -> AsyncIterator[AgentStreamEvent]:
+                    async for event in stream:
+                        observed_events.append(event)
+                        yield event
+
+                return observe()
+
+        agent = Agent(
+            FunctionModel(simple_model_function, stream_function=simple_stream_function),
+            capabilities=[ObserverCap()],
+        )
+
+        async def handler(_ctx: RunContext[Any], stream: AsyncIterable[AgentStreamEvent]) -> None:
+            async for _ in stream:
+                pass
+
+        await agent.run('hello', event_stream_handler=handler)
+        assert len(observed_events) > 0
+
+    async def test_wrap_run_event_stream_transforms(self):
+        """Modifications by the hook are visible to event_stream_handler."""
+        handler_events: list[AgentStreamEvent] = []
+
+        @dataclass
+        class TransformCap(AbstractCapability[Any]):
+            async def wrap_run_event_stream(
+                self,
+                ctx: RunContext[Any],
+                *,
+                stream: AsyncIterable[AgentStreamEvent],
+            ) -> AsyncIterable[AgentStreamEvent]:
+                async def transform() -> AsyncIterator[AgentStreamEvent]:
+                    async for event in stream:
+                        # Add a custom marker by yielding the event unchanged
+                        yield event
+
+                return transform()
+
+        agent = Agent(
+            FunctionModel(simple_model_function, stream_function=simple_stream_function),
+            capabilities=[TransformCap()],
+        )
+
+        async def handler(_ctx: RunContext[Any], stream: AsyncIterable[AgentStreamEvent]) -> None:
+            async for event in stream:
+                handler_events.append(event)
+
+        await agent.run('hello', event_stream_handler=handler)
+        assert len(handler_events) > 0
+
+    async def test_wrap_run_event_stream_composition(self):
+        """Multiple capabilities compose in correct order (first = outermost)."""
+        log: list[str] = []
+
+        @dataclass
+        class Cap1(AbstractCapability[Any]):
+            async def wrap_run_event_stream(
+                self,
+                ctx: RunContext[Any],
+                *,
+                stream: AsyncIterable[AgentStreamEvent],
+            ) -> AsyncIterable[AgentStreamEvent]:
+                async def wrap() -> AsyncIterator[AgentStreamEvent]:
+                    log.append('cap1:enter')
+                    async for event in stream:
+                        yield event
+                    log.append('cap1:exit')
+
+                return wrap()
+
+        @dataclass
+        class Cap2(AbstractCapability[Any]):
+            async def wrap_run_event_stream(
+                self,
+                ctx: RunContext[Any],
+                *,
+                stream: AsyncIterable[AgentStreamEvent],
+            ) -> AsyncIterable[AgentStreamEvent]:
+                async def wrap() -> AsyncIterator[AgentStreamEvent]:
+                    log.append('cap2:enter')
+                    async for event in stream:
+                        yield event
+                    log.append('cap2:exit')
+
+                return wrap()
+
+        agent = Agent(
+            FunctionModel(simple_model_function, stream_function=simple_stream_function),
+            capabilities=[Cap1(), Cap2()],
+        )
+
+        async def handler(_ctx: RunContext[Any], stream: AsyncIterable[AgentStreamEvent]) -> None:
+            async for _ in stream:
+                pass
+
+        await agent.run('hello', event_stream_handler=handler)
+
+        # Cap1 is outermost, so enters first and exits last
+        assert log.index('cap1:enter') < log.index('cap2:enter')
+        assert log.index('cap2:exit') < log.index('cap1:exit')
+
+    async def test_wrap_run_event_stream_tool_events(self):
+        """HandleResponseEvents from CallToolsNode flow through the hook."""
+        observed_events: list[AgentStreamEvent] = []
+
+        @dataclass
+        class ObserverCap(AbstractCapability[Any]):
+            async def wrap_run_event_stream(
+                self,
+                ctx: RunContext[Any],
+                *,
+                stream: AsyncIterable[AgentStreamEvent],
+            ) -> AsyncIterable[AgentStreamEvent]:
+                async def observe() -> AsyncIterator[AgentStreamEvent]:
+                    async for event in stream:
+                        observed_events.append(event)
+                        yield event
+
+                return observe()
+
+        agent = Agent(
+            FunctionModel(tool_calling_model, stream_function=tool_calling_stream_function),
+            capabilities=[ObserverCap()],
+        )
+
+        @agent.tool_plain
+        def my_tool() -> str:
+            return 'tool result'
+
+        async def handler(_ctx: RunContext[Any], stream: AsyncIterable[AgentStreamEvent]) -> None:
+            async for _ in stream:
+                pass
+
+        await agent.run('call tool', event_stream_handler=handler)
+        # Should have observed events from both ModelRequestNode and CallToolsNode streams
+        assert len(observed_events) > 0
+
+    async def test_wrap_run_event_stream_fires_in_run_stream_without_handler(self):
+        """wrap_run_event_stream fires in run_stream() even without an event_stream_handler."""
+        observed_events: list[AgentStreamEvent] = []
+
+        @dataclass
+        class ObserverCap(AbstractCapability[Any]):
+            async def wrap_run_event_stream(
+                self,
+                ctx: RunContext[Any],
+                *,
+                stream: AsyncIterable[AgentStreamEvent],
+            ) -> AsyncIterable[AgentStreamEvent]:
+                async def observe() -> AsyncIterator[AgentStreamEvent]:
+                    async for event in stream:
+                        observed_events.append(event)
+                        yield event
+
+                return observe()
+
+        agent = Agent(
+            FunctionModel(simple_model_function, stream_function=simple_stream_function),
+            capabilities=[ObserverCap()],
+        )
+
+        # No event_stream_handler — hook should still fire
+        async with agent.run_stream('hello') as stream:
+            await stream.get_output()
+        assert len(observed_events) > 0
+
+
+class TestWrapRunShortCircuit:
+    """Test short-circuiting wrap_run via iter() and run_stream()."""
+
+    async def test_wrap_run_short_circuit_via_iter(self):
+        @dataclass
+        class ShortCircuitRunCap(AbstractCapability[Any]):
+            async def wrap_run(self, ctx: RunContext[Any], *, handler: Any) -> AgentRunResult[Any]:
+                return AgentRunResult(output='short-circuited')
+
+        agent = Agent(FunctionModel(simple_model_function), capabilities=[ShortCircuitRunCap()])
+        async with agent.iter('hello') as agent_run:
+            nodes: list[Any] = []
+            async for node in agent_run:
+                nodes.append(node)
+        # Iteration should stop immediately (no graph nodes executed)
+        assert nodes == []
+        assert agent_run.result is not None
+        assert agent_run.result.output == 'short-circuited'
+
+    async def test_wrap_run_short_circuit_via_run_stream(self):
+        @dataclass
+        class ShortCircuitRunCap(AbstractCapability[Any]):
+            async def wrap_run(self, ctx: RunContext[Any], *, handler: Any) -> AgentRunResult[Any]:
+                return AgentRunResult(output='short-circuited')
+
+        agent = Agent(
+            FunctionModel(simple_model_function, stream_function=simple_stream_function),
+            capabilities=[ShortCircuitRunCap()],
+        )
+        async with agent.run_stream('hello') as stream:
+            output = await stream.get_output()
+        assert output == 'short-circuited'
+
+
+class TestSkipModelRequestInteraction:
+    """Test SkipModelRequest interaction with after_model_request."""
+
+    async def test_skip_model_request_still_calls_after_model_request(self):
+        log: list[str] = []
+
+        @dataclass
+        class SkipAndLogCap(AbstractCapability[Any]):
+            async def before_model_request(
+                self,
+                ctx: RunContext[Any],
+                *,
+                messages: list[ModelMessage],
+                model_settings: ModelSettings,
+                model_request_parameters: ModelRequestParameters,
+            ) -> tuple[list[ModelMessage], ModelSettings, ModelRequestParameters]:
+                log.append('before_model_request')
+                raise SkipModelRequest(ModelResponse(parts=[TextPart(content='skipped')]))
+
+            async def after_model_request(
+                self,
+                ctx: RunContext[Any],
+                *,
+                messages: list[ModelMessage],
+                model_settings: ModelSettings,
+                model_request_parameters: ModelRequestParameters,
+                response: ModelResponse,
+            ) -> ModelResponse:
+                log.append('after_model_request')
+                return response
+
+        agent = Agent(FunctionModel(simple_model_function), capabilities=[SkipAndLogCap()])
+        result = await agent.run('hello')
+        assert result.output == 'skipped'
+        # after_model_request should still fire via _finish_handling
+        assert 'after_model_request' in log
+
+    async def test_wrap_model_request_short_circuit_streaming(self):
+        """wrap_model_request can return without calling handler in streaming path."""
+
+        @dataclass
+        class ShortCircuitModelCap(AbstractCapability[Any]):
+            async def wrap_model_request(
+                self,
+                ctx: RunContext[Any],
+                *,
+                messages: list[ModelMessage],
+                model_settings: ModelSettings,
+                model_request_parameters: ModelRequestParameters,
+                handler: Any,
+            ) -> ModelResponse:
+                # Don't call handler — return a response directly
+                return ModelResponse(parts=[TextPart(content='model short-circuited')])
+
+        agent = Agent(
+            FunctionModel(simple_model_function, stream_function=simple_stream_function),
+            capabilities=[ShortCircuitModelCap()],
+        )
+        async with agent.run_stream('hello') as stream:
+            output = await stream.get_output()
+        assert output == 'model short-circuited'

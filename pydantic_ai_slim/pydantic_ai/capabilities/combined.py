@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import AsyncIterable, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from pydantic_ai import _instructions, _system_prompt
 from pydantic_ai.builtin_tools import AbstractBuiltinTool
-from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
+from pydantic_ai.messages import AgentStreamEvent, ModelMessage, ModelResponse, ToolCallPart
 from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.settings import ModelSettings, merge_model_settings
 from pydantic_ai.tools import AgentDepsT, BuiltinToolFunc, RunContext
@@ -75,6 +75,18 @@ class CombinedCapability(AbstractCapability[AgentDepsT]):
         for cap in reversed(self.capabilities):
             chain = _make_run_wrap(cap, ctx, chain)
         return await chain()
+
+    # --- Event stream hook ---
+
+    async def wrap_run_event_stream(
+        self,
+        ctx: RunContext[AgentDepsT],
+        *,
+        stream: AsyncIterable[AgentStreamEvent],
+    ) -> AsyncIterable[AgentStreamEvent]:
+        for cap in reversed(self.capabilities):
+            stream = await cap.wrap_run_event_stream(ctx, stream=stream)
+        return stream
 
     # --- Model request lifecycle hooks ---
 
