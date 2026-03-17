@@ -621,6 +621,16 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
             validated_spec = spec
         template_context['deps_schema'] = validated_spec.deps_schema
 
+        effective_output_type: OutputSpec[Any]
+        if output_type is not str:
+            effective_output_type = output_type
+        elif validated_spec.output_schema is not None:
+            from pydantic_ai.output import StructuredDict
+
+            effective_output_type = StructuredDict(validated_spec.output_schema)
+        else:
+            effective_output_type = str
+
         registry = build_registry(
             custom_types=custom_capability_types,
             defaults=DEFAULT_CAPABILITY_TYPES,
@@ -655,7 +665,7 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
 
         return Agent(
             model=model or validated_spec.model,
-            output_type=output_type,
+            output_type=effective_output_type,
             instructions=merged_instructions or None,
             system_prompt=system_prompt,
             deps_type=deps_type,

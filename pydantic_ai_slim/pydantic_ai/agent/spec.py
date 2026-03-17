@@ -42,6 +42,7 @@ class AgentSpec(BaseModel):
     description: TemplateStr[Any] | str | None = None
     instructions: TemplateStr[Any] | str | list[TemplateStr[Any] | str] | None = None
     deps_schema: dict[str, Any] | None = None
+    output_schema: dict[str, Any] | None = None
     model_settings: dict[str, Any] | None = None
     retries: int = 1
     output_retries: int | None = None
