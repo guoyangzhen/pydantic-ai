@@ -175,7 +175,7 @@ def _hint_contains_template_str(hint: Any) -> bool:
 def _import_pydantic_handlebars() -> Any:
     """Lazily import pydantic-handlebars with a helpful error message."""
     try:
-        import pydantic_handlebars  # pyright: ignore[reportMissingImports]
+        import pydantic_handlebars
 
         return pydantic_handlebars
     except ImportError as e:
